@@ -1,13 +1,11 @@
-name: 🎮 Daily Task (Gemini API免费方案)
+name: 🎮 Daily Task (Gemini免费方案)
 
 on:
   repository_dispatch:
     types: [daily-task]
   workflow_dispatch:
   schedule:
-    # 全部安排在北京时间 23:30 以后的深夜非高峰期，间隔1小时
-    # UTC 时间，对应北京时间: 23:37 / 00:37 / 01:37 / 02:37 / 03:37
-    - cron: '37 15,16,17,18,19 * * *'
+    - cron: '10 0,3,6,9,12,15,18,21 * * *'
 
 concurrency:
   group: daily-task-run
@@ -17,7 +15,7 @@ jobs:
   run-task:
     name: 🎮 Daily Task
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45  # 增加到45分钟
 
     steps:
       - name: 1. 检出代码
@@ -28,7 +26,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ── 依赖缓存：pip 包 + Playwright 浏览器，命中缓存只需 ~20 秒 ──
+      # ── 依赖缓存 ──
       - name: 3. 缓存 pip 包
         uses: actions/cache@v4
         with:
@@ -40,17 +38,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: pw-v1-${{ runner.os }}-chromium
+          key: pw-v1-${{ runner.os }}-chromium-v2
           restore-keys: pw-v1-${{ runner.os }}-
 
-      - name: 5. 安装依赖（有缓存时秒过）
+      - name: 5. 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -U playwright requests pyyaml 'hcaptcha-challenger>=0.19'
+          pip install -U playwright requests pyyaml 'hcaptcha-challenger>=0.19' google-genai
           python -m playwright install chromium --with-deps
           echo "✅ Python 依赖完成"
 
-      - name: 6. 安装 Sing-Box（代理转换）
+      - name: 6. 安装 Sing-Box
         env:
           PROXY_STR: ${{ secrets.TASK_PROXY_STR }}
         run: |
@@ -63,8 +61,7 @@ jobs:
             echo "ℹ️ 未配置代理，跳过"
           fi
 
-      # ── 执行任务：CF 真人验证时自动换下一个节点，最多尝试全部节点 ──
-      # 脚本返回码：0=成功，1=普通失败，2=CF 真人验证，触发换节点
+      # ── 执行任务（带重试机制）──
       - name: 7. 执行任务
         env:
           ACCOUNTS:       ${{ secrets.TASK_ACCOUNTS }}
@@ -75,29 +72,30 @@ jobs:
           TG_BOT_TOKEN:   ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:     ${{ secrets.TG_CHAT_ID }}
         run: |
-          set +e
-          # 用 grep -c . 数非空行，避免 wc -l 因末尾无换行而少算
-          NODE_COUNT=$(printf '%s\n' "$PROXY_STR" | tr ',' '\n' | grep -c .)
-          [ "$NODE_COUNT" -lt 1 ] && NODE_COUNT=1
-          RESULT=1
-          for ((i=0; i<NODE_COUNT; i++)); do
-            echo "▶️ 尝试代理节点索引: $i / $NODE_COUNT"
-            PROXY_INDEX=$i python daily_task.py
-            RESULT=$?
-            echo "  ↳ 退出码: $RESULT"
-            if [ "$RESULT" -eq 0 ]; then
-              echo "✅ 任务成功"
+          # 添加任务级重试
+          for i in 1 2 3; do
+            echo "=========================================="
+            echo "🚀 第 $i 次运行尝试"
+            echo "=========================================="
+            
+            # 运行主脚本
+            python daily_task.py
+            
+            # 检查退出码
+            if [ $? -eq 0 ]; then
+              echo "✅ 任务成功完成"
               exit 0
-            elif [ "$RESULT" -eq 2 ]; then
-              echo "⚠️ 当前节点触发 Cloudflare 真人验证，切换下一个节点"
-              continue
             else
-              echo "❌ 任务失败（退出码 $RESULT），停止重试"
-              exit "$RESULT"
+              echo "❌ 任务失败（第 $i 次）"
+              if [ $i -lt 3 ]; then
+                echo "⏳ 等待 30 秒后重试..."
+                sleep 30
+              fi
             fi
           done
-          echo "❌ 所有 $NODE_COUNT 个代理节点均触发 Cloudflare 或失败"
-          exit "$RESULT"
+          
+          echo "❌ 所有尝试均失败"
+          exit 1
 
       - name: 8. 上传截图
         if: always()
@@ -105,4 +103,5 @@ jobs:
         with:
           name: screenshots-${{ github.run_number }}
           path: screenshots/
-          retention-days: 3
+          retention-days: 7  # 增加到7天
+          if-no-files-found: ignore
